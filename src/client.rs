@@ -20,6 +20,7 @@ struct ChatBehaviour {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ChatOutEvent {
     Floodsub(FloodsubEvent),
     Mdns(mdns::Event),
