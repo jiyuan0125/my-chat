@@ -2,7 +2,7 @@ use clap::Parser;
 use dotenv::dotenv;
 use log::debug;
 
-mod chat;
+mod client;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -21,12 +21,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     debug!("Cli: {:?}", cli);
 
-    chat::run(
+    let mut client = client::Client::new(
         &cli.name,
         cli.listen_addr.as_deref(),
         cli.to_dial.as_deref(),
     )
     .await?;
+
+    client.start().await;
 
     Ok(())
 }
