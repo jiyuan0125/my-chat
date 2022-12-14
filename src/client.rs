@@ -1,29 +1,57 @@
+use crate::client::layer::{Chat, ChatEvent};
+use crate::client::topic::Topic;
 use async_std::io;
 use futures::{
     prelude::{stream::StreamExt, *},
     select,
 };
 use libp2p::{
-    floodsub::{self, Floodsub, FloodsubEvent},
     identity, mdns,
-    swarm::{NetworkBehaviour, SwarmEvent, keep_alive::Behaviour as KeepAliveBehaviour},
+    swarm::{keep_alive::Behaviour as KeepAliveBehaviour, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use log::{error, info};
+use once_cell::sync::OnceCell;
+
+mod layer;
+mod pb;
+mod protocol;
+mod topic;
+
+static TOPIC: OnceCell<Topic> = OnceCell::new();
+
+#[derive(Debug, Clone)]
+pub struct ChatConfig {
+    /// Peer id of the local node. Used for the source of the messages that we publish.
+    pub local_peer_id: PeerId,
+
+    /// `true` if messages published by local node should be propagated as messages received from
+    /// the network, `false` by default.
+    pub subscribe_local_messages: bool,
+}
+
+impl ChatConfig {
+    pub fn new(local_peer_id: PeerId) -> Self {
+        Self {
+            local_peer_id,
+            subscribe_local_messages: false,
+        }
+    }
+}
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "ChatOutEvent")]
 struct ChatBehaviour {
-    floodsub: Floodsub,
-    mdns: mdns::async_io::Behaviour,
     keep_alive: KeepAliveBehaviour,
+    chat: Chat,
+    mdns: mdns::async_io::Behaviour,
 }
 
 #[derive(Debug)]
 enum ChatOutEvent {
-    Floodsub(FloodsubEvent),
-    Mdns(mdns::Event),
     KeepAlive,
+    Chat(ChatEvent),
+    Mdns(mdns::Event),
 }
 
 impl From<mdns::Event> for ChatOutEvent {
@@ -32,9 +60,9 @@ impl From<mdns::Event> for ChatOutEvent {
     }
 }
 
-impl From<FloodsubEvent> for ChatOutEvent {
-    fn from(v: FloodsubEvent) -> Self {
-        ChatOutEvent::Floodsub(v)
+impl From<ChatEvent> for ChatOutEvent {
+    fn from(v: ChatEvent) -> Self {
+        ChatOutEvent::Chat(v)
     }
 }
 
@@ -44,15 +72,8 @@ impl From<void::Void> for ChatOutEvent {
     }
 }
 
-fn get_public_topic() -> floodsub::Topic {
-    get_topic("public")
-}
-
-fn get_topic(topic_name: &str) -> floodsub::Topic {
-    floodsub::Topic::new(format!("chat_{}", topic_name))
-}
-
 pub struct Client {
+    name: String,
     swarm: Swarm<ChatBehaviour>,
 }
 
@@ -62,6 +83,8 @@ impl Client {
         listen_addr: Option<&str>,
         to_dial: Option<&str>,
     ) -> anyhow::Result<Self> {
+        TOPIC.get_or_init(|| "chat".parse().unwrap());
+
         let local_key = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
         info!("Local peer id: {local_peer_id:?}");
@@ -71,26 +94,17 @@ impl Client {
         let mut swarm = {
             let mdns = mdns::async_io::Behaviour::new(mdns::Config::default())?;
             let behaviour = ChatBehaviour {
-                floodsub: Floodsub::new(local_peer_id),
-                mdns,
                 keep_alive: KeepAliveBehaviour,
+                chat: Chat::new(local_peer_id),
+                mdns,
             };
             Swarm::with_threadpool_executor(transport, behaviour, local_peer_id)
         };
 
-        let public_topic = get_public_topic();
-        let private_topic = get_topic(name);
-
         swarm
             .behaviour_mut()
-            .floodsub
-            .subscribe(public_topic.clone());
-        info!("Subscribed to topic: {public_topic:?}");
-        swarm
-            .behaviour_mut()
-            .floodsub
-            .subscribe(private_topic.clone());
-        info!("Subscribed to topic: {private_topic:?}");
+            .chat
+            .subscribe(TOPIC.get().unwrap().clone());
 
         if let Some(to_dial) = to_dial {
             let addr: Multiaddr = to_dial.parse()?;
@@ -105,27 +119,24 @@ impl Client {
 
         swarm.listen_on(listen_addr.parse()?)?;
 
-        Ok(Client { swarm })
+        Ok(Client { name: name.to_string(), swarm })
     }
 
     pub async fn start(&mut self) {
         let mut stdin = io::BufReader::new(io::stdin()).lines().fuse();
-        let public_topic = get_public_topic();
         loop {
             select! {
                 line = stdin.select_next_some() => match line {
                     Ok(line) => {
-                        if line.starts_with('@') {
-                            // Send a private message.
+                        let (to_name, msg) = if line.starts_with('@') {
                             let mut parts = line.splitn(2, ' ');
-                            if let (Some(name), Some(msg)) = (parts.next(), parts.next()) {
-                                let topic = get_topic(name.trim_start_matches('@'));
-                                self.swarm.behaviour_mut().floodsub.publish_any(topic.clone(), msg.as_bytes());
-                            }
+                            let to_name = parts.next().unwrap().trim_start_matches('@');
+                            let msg = parts.next().unwrap_or("");
+                            (Some(to_name), msg)
                         } else {
-                            // Send a public message.
-                            self.swarm.behaviour_mut().floodsub.publish(public_topic.clone(), line.as_bytes());
-                        }
+                            (None, line.as_str())
+                        };
+                        self.swarm.behaviour_mut().chat.publish_any(&self.name, to_name, TOPIC.get().unwrap().clone(), msg.as_bytes());
                     }
                     Err(e) => {
                         error!("Error reading from stdin: {e}");
@@ -135,12 +146,13 @@ impl Client {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("Listening on {address:?}");
                     }
-                    SwarmEvent::Behaviour(ChatOutEvent::Floodsub(
-                        FloodsubEvent::Message(message)
+                    SwarmEvent::Behaviour(ChatOutEvent::Chat(
+                        ChatEvent::Message(message)
                     )) => {
                         eprintln!(
-                            "{:?}>{:?}",
-                            message.source,
+                            "{} -> {}: {}",
+                            message.source_name,
+                            message.to_name.unwrap_or("all".to_string()),
                             String::from_utf8_lossy(&message.data),
                         );
                     }
@@ -150,7 +162,7 @@ impl Client {
                         for (peer, _) in list {
                             self.swarm
                                 .behaviour_mut()
-                                .floodsub
+                                .chat
                                 .add_node_to_partial_view(peer);
                         }
                     }
@@ -161,7 +173,7 @@ impl Client {
                             if !self.swarm.behaviour_mut().mdns.has_node(&peer) {
                                 self.swarm
                                     .behaviour_mut()
-                                    .floodsub
+                                    .chat
                                     .remove_node_from_partial_view(&peer);
                             }
                         }
