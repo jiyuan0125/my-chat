@@ -119,7 +119,10 @@ impl Client {
 
         swarm.listen_on(listen_addr.parse()?)?;
 
-        Ok(Client { name: name.to_string(), swarm })
+        Ok(Client {
+            name: name.to_string(),
+            swarm,
+        })
     }
 
     pub async fn start(&mut self) {
@@ -149,12 +152,15 @@ impl Client {
                     SwarmEvent::Behaviour(ChatOutEvent::Chat(
                         ChatEvent::Message(message)
                     )) => {
-                        eprintln!(
-                            "{} -> {}: {}",
-                            message.source_name,
-                            message.to_name.unwrap_or("all".to_string()),
-                            String::from_utf8_lossy(&message.data),
-                        );
+                        match &message.to_name {
+                            Some(to_name) if to_name == &self.name => {
+                                eprintln!("{} -> {}: {}", message.source_name, to_name, String::from_utf8_lossy(&message.data));
+                            }
+                            None => {
+                                eprintln!("{} -> all: {}", message.source_name, String::from_utf8_lossy(&message.data));
+                            }
+                            _ => {}
+                        }
                     }
                     SwarmEvent::Behaviour(ChatOutEvent::Mdns(
                         mdns::Event::Discovered(list)
